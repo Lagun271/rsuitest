@@ -100,7 +100,13 @@ class Tee:
         sys.stdout = self
 
     def write(self, s):
-        self._out.write(s)
+        try:
+            self._out.write(s)
+        except UnicodeEncodeError:
+            # A console in cp1252 cannot show e.g. RobotStudio's licence dialog buttons ('✕', '🔑'); writing them
+            # raised and turned a recorded error into a crash (2026-11-11). The console gets '?', run.log the text.
+            enc = getattr(self._out, "encoding", None) or "ascii"
+            self._out.write(s.encode(enc, "replace").decode(enc))
         self._f.write(s)
 
     def flush(self):
@@ -183,8 +189,8 @@ class Run:
             return False
 
     def robotstudio_errors(self) -> list[str]:
-        """Copy RobotStudio's error logs written during the run (ERROR_LOGS\\RobotStudio-*.rslog; RobotStudio writes
-        one only when something goes wrong) into the report and return one line per exception in them."""
+        """Copy RobotStudio's logs written during the run (ERROR_LOGS\\RobotStudio-*.rslog: exceptions with stack
+        traces, but also logs with only UI-thread warnings) into the report and return one line per exception."""
         out = []
         for log in sorted(ERROR_LOGS.glob("RobotStudio-*.rslog")) if ERROR_LOGS.is_dir() else []:
             try:
@@ -195,7 +201,6 @@ class Run:
             except OSError as e:
                 out.append(f"{log.name}: not readable ({e})")
                 continue
-            found = False
             for i, line in enumerate(lines):
                 parts = line.split("|")
                 if len(parts) >= 4 and parts[1] == "Exception":
@@ -206,9 +211,6 @@ class Run:
                                 break
                             msg.append(m.strip())
                     out.append(f"{parts[3]} ({parts[4] if len(parts) > 4 else ''}): {' '.join(msg)} [{log.name}]")
-                    found = True
-            if not found:
-                out.append(f"{log.name} (no exception line; copied)")
         return out
 
     def verdict(self) -> tuple[str, int]:
@@ -355,13 +357,15 @@ class DialogAppeared(RuntimeError):
 
 
 class NoLicence(DialogAppeared):
-    """RobotStudio shows its licence dialog ('Access Application': Log In, Activate Node Locked License, Freemium,
-    Trial): no licence that starts add-ins (seen 2026-11-11 after a Trial licence expired)."""
+    """RobotStudio shows one of its licence dialogs: no licence that starts add-ins. Seen 2026-11-11 after a Trial
+    licence expired: 'Access Application' (Log In, Activate Node Locked License, Freemium, Trial) and 'Your Free
+    Trial Has Ended.' (View My Cloud Projects, Request License, Cancel)."""
 
 
 def dialog_error(d: "Dialog", prefix: str = "Dialog appeared: ") -> DialogAppeared:
-    """The exception for a dialog that stops a wait: NoLicence for RobotStudio's licence dialog."""
-    if "Access Application" in d.message or any("Node Locked License" in b for b in d.buttons):
+    """The exception for a dialog that stops a wait: NoLicence for RobotStudio's licence dialogs."""
+    if ("Access Application" in d.message or "Trial Has Ended" in f"{d.title} {d.message}"
+            or any("Node Locked License" in b or b == "Request License" for b in d.buttons)):
         return NoLicence(f"RobotStudio has no licence that starts add-ins (its licence dialog is open): {d}")
     return DialogAppeared(prefix + str(d))
 

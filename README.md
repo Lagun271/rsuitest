@@ -207,9 +207,12 @@ Each `Run` writes to its report folder:
   (`| Criterion | Must be true | Result | Evidence |`, result `met` / `**not met**` / `not checked`), a table of steps
   (`| Step | Seen | Screenshot | s |`), then "Unexpected" (errors, retried clicks) and "Noted" (dialogs answered
   automatically through `AUTO_ANSWERS`), which are not part of the verdict.
-- RobotStudio's own error logs written during the run (`C:\ProgramData\ABB\RobotStudio\ErrorLogs\RobotStudio-*.rslog`,
-  with stack traces) are copied into the report folder and their exceptions listed in `result.md` under a heading of
-  their own. They are RobotStudio's code, not the add-in's, and not part of the verdict.
+- RobotStudio's own logs written during the run (`C:\ProgramData\ABB\RobotStudio\ErrorLogs\RobotStudio-*.rslog`;
+  exceptions with stack traces, sometimes only UI-thread warnings) are copied into the report folder, and their
+  exceptions listed in `result.md` under a heading of their own. They are RobotStudio's code, not the add-in's, and
+  not part of the verdict.
+- The console may show `?` for characters it cannot display (e.g. `✕` on a dialog button); `run.log` and
+  `result.md` keep them.
 - `run.log`: everything the test printed.
 - Screenshots (`shot`) and, if the test reads it, RobotStudio's Output window (`output-<when>.txt`).
 
@@ -232,9 +235,11 @@ Verified with RobotStudio 2026.4; read before writing a test.
   shows is there (`TAB_GROUPS`).
 - **Every wait watches for modal dialogs** (see "A run never hangs"). `AUTO_ANSWERS` answers expected ones;
   `dialogs(pid, main)` reads any open dialog as text, `modal_dialog(main)` finds the one blocking the main window.
-- **RobotStudio's licence dialog** ("Access Application": Log In, Activate Node Locked License, Freemium, Trial)
-  appears over the main window after start when there is no licence. UI Automation read it during start-up but not
-  while RobotStudio was closing (`COMError`).
+- **RobotStudio's licence dialogs** appear over the main window after start when there is no licence: "Access
+  Application" (Log In, Activate Node Locked License, Freemium, Trial) or "Your Free Trial Has Ended." (View My
+  Cloud Projects, Request License, Cancel). UI Automation read them during start-up but not while RobotStudio was
+  closing (`COMError`). Their own Cancel / ✕ ends RobotStudio cleanly; `WM_CLOSE` to the main window behind them
+  made it crash.
 - **Never kill RobotStudio.** Its virtual controller (`RobVC.exe`) survives, and the next RobotStudio asks whether to
   terminate it. `shutdown()` / `rsuitest-close` close through the UI (`WM_CLOSE`; UIA `Close()` was ignored).
 - **Never UIA-`Invoke` a button that opens a modal dialog**: it blocks until the dialog closes, then fails. Use

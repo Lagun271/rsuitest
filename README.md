@@ -147,8 +147,9 @@ Find the names to target with `.\run.ps1 dump_tree` (or `rsuitest-dump-tree`) wh
   goes into "RobotStudio 2026 UIA facts" below.
 - **Add-in specific** (its tab, dialogs, log file, version): in the test project's own module (`myaddin.py` in the
   example), not here.
-- Release: raise `version` in `pyproject.toml` and `__version__` in `src/rsuitest/__init__.py`, commit, tag
-  `vX.Y.Z`, push the tag. Projects move their pin to the new tag (`uv add ... --tag vX.Y.Z`).
+- Release: raise `version` in `pyproject.toml` and `__version__` in `src/rsuitest/__init__.py` as described in
+  "Versioning", commit, tag `vX.Y.Z`, push the tag. Projects move their pin to the new tag
+  (`uv add ... --tag vX.Y.Z`).
 
 ## Writing tests with Claude Code and computer use
 
@@ -225,6 +226,26 @@ Verified with RobotStudio 2026.4; read before writing a test.
   RobotStudio makes backups in `<project>\Backups\`. Copying only the `.rsstn` does not isolate a test.
 - pywinauto 0.6.9: a wrapper (from `.wrapper_object()` / `.children()`) has no `child_window`, only a spec does.
   Enumerating `descendants()` of a whole dialog can take tens of seconds; look controls up by `auto_id` / `title`.
+
+## Versioning
+
+[Semantic Versioning](https://semver.org). Before 1.0.0 the minor version takes the role of the major one:
+
+| Change | Examples | Next version |
+|---|---|---|
+| Breaking | A public name removed or renamed, a changed signature or default, a changed environment variable, command or argument, a changed `result.md` format or exit code | minor: 0.1.x → 0.2.0 |
+| Compatible | A new helper, a bug fix, a more robust wait, a new UIA fact | patch: 0.1.0 → 0.1.1 |
+| Documentation only | README, comments | no new tag |
+
+The public API is: the names without a leading `_` in `rsuitest.core` and `rsuitest.pim`, the `rsuitest-*` commands
+and their arguments, the `RSUITEST_*` environment variables, the `result.md` format and the exit codes 0/1/2, and the
+template in `scripts/`. Everything else may change in any release.
+
+1.0.0 comes when the API has been used by real test projects for a while without a breaking change; from then on a
+breaking change raises the major version, a new feature the minor and a fix the patch.
+
+Projects pin an exact tag, so nothing changes under them by accident. The version tells how much to check before
+moving the pin: after a patch, run the tests; after a minor (before 1.0) or major, read the changes first.
 
 ## Known limitations
 

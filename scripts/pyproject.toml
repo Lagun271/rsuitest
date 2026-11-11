@@ -5,7 +5,7 @@ version = "0.1.0"
 description = "UI tests of my RobotStudio add-in"
 requires-python = ">=3.12"
 dependencies = [
-    "rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.1.0/rsuitest-0.1.0-py3-none-any.whl",
+    "rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.2.0/rsuitest-0.2.0-py3-none-any.whl",
 ]
 
 [tool.uv]

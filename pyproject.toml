@@ -1,6 +1,6 @@
 [project]
 name = "rsuitest"
-version = "0.1.0"
+version = "0.2.0"
 description = "UI Automation test helpers for RobotStudio 2026 add-ins (pywinauto), and a reader for saved stations (PIM.xml)"
 readme = "README.md"
 license = "MIT"

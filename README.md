@@ -25,7 +25,8 @@ writes a report. Each test declares success criteria; the verdict is about those
   front, so keep the mouse and keyboard untouched while a test runs.
 - Display scaling: developed and run at 200 %. The helpers use UIA rectangles and pywinauto's clicks, which run
   DPI-aware; other scalings are expected to work but are not tested.
-- RobotStudio licence that allows add-ins (the Free licence does not start any add-in).
+- RobotStudio licence that allows add-ins (the Free licence does not start any add-in). Without one RobotStudio shows
+  its licence dialog ("Access Application") and a test stops at once with `NoLicence`.
 
 ## Installation
 
@@ -33,15 +34,15 @@ Pin to a version. Not on PyPI; each [release](https://github.com/Lagun271/rsuite
 which needs nothing but HTTPS (no git):
 
 ```toml
-dependencies = ["rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.1.0/rsuitest-0.1.0-py3-none-any.whl"]
+dependencies = ["rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.2.0/rsuitest-0.2.0-py3-none-any.whl"]
 ```
 
-or with pip: `pip install https://github.com/Lagun271/rsuitest/releases/download/v0.1.0/rsuitest-0.1.0-py3-none-any.whl`.
+or with pip: `pip install https://github.com/Lagun271/rsuitest/releases/download/v0.2.0/rsuitest-0.2.0-py3-none-any.whl`.
 
 From the tag with git instead (uv and pip then need `git` on the machine):
 
 ```powershell
-uv add "git+https://github.com/Lagun271/rsuitest" --tag v0.1.0
+uv add "git+https://github.com/Lagun271/rsuitest" --tag v0.2.0
 ```
 
 ### Self-contained test folder (template in `scripts/`)
@@ -105,10 +106,10 @@ try:
         run.check("A1", title.startswith("My Addin"), repr(title))
         rs.press(rs.find(dlg, title="OK", control_types=("Button",)))
 except Exception as e:  # noqa: BLE001
-    run.error(e, main)
+    run.error(e, main)                          # message + error.png of the main window
 finally:
     if pid:
-        rs.shutdown(pid)
+        run.close_robotstudio(pid)              # never raises; leaves RobotStudio open on a dialog
     verdict, code = run.verdict()
     run.finish(verdict)
 sys.exit(code)
@@ -171,6 +172,33 @@ asked; a terminal `claude` on Windows has no computer use).
 - **Never both at once.** While a script runs, the agent (and you) keep the mouse and keyboard untouched; computer
   use acts only at a handoff point, when the script waits.
 
+## A run never hangs: dialogs and timeouts
+
+- **Every wait watches for dialogs** and stops at once with the dialog's title, text and buttons (`DialogAppeared`;
+  `NoLicence` for RobotStudio's licence dialog), unless `AUTO_ANSWERS` answers it; `run.error(e, main)` adds a
+  screenshot. A modal dialog
+  is found through Win32 (it disables its owner window), so also when UI Automation cannot read it.
+- **RobotStudio is left as it is** when a test stops on a dialog: `shutdown()` refuses to close behind an open
+  dialog and stops if a dialog it does not expect appears while closing. In a test's `finally`, use
+  `run.close_robotstudio(pid)`: it records such an error instead of raising it, so `result.md` is still written. Closing the main window behind a modal
+  dialog during start-up made RobotStudio throw in its own code and end in "RobotStudio - fatal error". Close it
+  afterwards with `rsuitest-close` (`run.ps1 close`), after looking.
+- **Timeouts are short.** Lookups, dialogs and clicks give up after 5 s. The long steps (`attach`, `tab`,
+  `load_powerpac`, `wait_controllers_ready`, `simulation_play`, `save`, `shutdown`) wait as long as RobotStudio
+  shows progress and give up after 5 s without any (`Stalled`); progress is CPU time used by RobotStudio and its
+  virtual controllers (`STALL_CPU`, 0.25 s). Each also has a ceiling.
+- **Changing them**: `TIMEOUTS` holds every default (seconds).
+
+  ```python
+  rs.TIMEOUTS["save"] = 300                    # for the whole test
+  with rs.timeouts(controller=600, stall=15):  # for a block; restored afterwards
+      rs.wait_controllers_ready(main)
+  rs.save(main, station, timeout=60)           # for one call
+  ```
+
+  `RSUITEST_TIMEOUT_SCALE=2` multiplies every default on a slow machine. A test's own long wait can use the same
+  rule: `rs.wait_until(cond, rs.limit("controller"), "what", watch=main, stall=True)`.
+
 ## Report format
 
 Each `Run` writes to its report folder:
@@ -179,6 +207,9 @@ Each `Run` writes to its report folder:
   (`| Criterion | Must be true | Result | Evidence |`, result `met` / `**not met**` / `not checked`), a table of steps
   (`| Step | Seen | Screenshot | s |`), then "Unexpected" (errors, retried clicks) and "Noted" (dialogs answered
   automatically through `AUTO_ANSWERS`), which are not part of the verdict.
+- RobotStudio's own error logs written during the run (`C:\ProgramData\ABB\RobotStudio\ErrorLogs\RobotStudio-*.rslog`,
+  with stack traces) are copied into the report folder and their exceptions listed in `result.md` under a heading of
+  their own. They are RobotStudio's code, not the add-in's, and not part of the verdict.
 - `run.log`: everything the test printed.
 - Screenshots (`shot`) and, if the test reads it, RobotStudio's Output window (`output-<when>.txt`).
 
@@ -199,9 +230,11 @@ Verified with RobotStudio 2026.4; read before writing a test.
   switching does nothing. `foreground()` handles it; a locked screen stops a run.
 - **Ribbon TabItems never report themselves selected.** `tab()` clicks the tab and checks that a group only that tab
   shows is there (`TAB_GROUPS`).
-- **Every wait watches for modal dialogs** and stops at once with the dialog's title, message and buttons
-  (`DialogAppeared`) instead of timing out. `AUTO_ANSWERS` answers expected ones; `dialogs(pid, main)` reads any open
-  dialog as text.
+- **Every wait watches for modal dialogs** (see "A run never hangs"). `AUTO_ANSWERS` answers expected ones;
+  `dialogs(pid, main)` reads any open dialog as text, `modal_dialog(main)` finds the one blocking the main window.
+- **RobotStudio's licence dialog** ("Access Application": Log In, Activate Node Locked License, Freemium, Trial)
+  appears over the main window after start when there is no licence. UI Automation read it during start-up but not
+  while RobotStudio was closing (`COMError`).
 - **Never kill RobotStudio.** Its virtual controller (`RobVC.exe`) survives, and the next RobotStudio asks whether to
   terminate it. `shutdown()` / `rsuitest-close` close through the UI (`WM_CLOSE`; UIA `Close()` was ignored).
 - **Never UIA-`Invoke` a button that opens a modal dialog**: it blocks until the dialog closes, then fails. Use
@@ -255,6 +288,9 @@ moving the pin: after a patch, run the tests; after a minor (before 1.0) or majo
 - The 3D view is not in the UIA tree. Check results in the saved station (`rsuitest.pim`) or leave that step to a
   person.
 - `frame_size()` clicks by position inside the popup.
+- The progress signal for the long steps is CPU time. A step where RobotStudio waits without using the CPU (e.g. on
+  the network) can be taken for a hung one: raise `TIMEOUTS["stall"]` for it. A wait that reads RobotStudio's UI
+  itself (`wait_controllers_ready` scrolls the Output window) makes RobotStudio use CPU, so there the ceiling counts.
 - No PyPI release; install the wheel from a GitHub Release, or from git with a tag.
 
 ## Licence

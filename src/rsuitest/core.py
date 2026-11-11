@@ -13,9 +13,11 @@ from __future__ import annotations
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,64 @@ RS_EXE = Path(os.environ.get("RSUITEST_RS_EXE")
 ADDIN: Path | None = Path(os.environ["RSUITEST_ADDIN"]) if os.environ.get("RSUITEST_ADDIN") else None
 # folder name of the add-in's installed .rspak, e.g. "Vendor.Product-*"
 PACKAGE_GLOB: str | None = os.environ.get("RSUITEST_PACKAGE_GLOB") or None
+ERROR_LOGS = Path(os.environ.get("ProgramData") or r"C:\ProgramData") / "ABB" / "RobotStudio" / "ErrorLogs"
+
+
+# ---------------------------------------------------------------- timeouts
+# Seconds, kept short: a dialog stops any wait at once (watch_dialogs), so a timeout only covers RobotStudio working
+# without showing anything. Lookups and clicks have a fixed limit. The long steps (start, tab switch, PowerPac load,
+# controller, simulation, save, close) wait as long as RobotStudio shows progress and give up after "stall" seconds
+# without any (wait_until(..., stall=True)); their value here is only a ceiling. A test's own long wait can use the
+# same rule: wait_until(cond, limit("controller"), "what", watch=main, stall=True).
+# Change: for a whole test TIMEOUTS["save"] = 60; for a block `with timeouts(controller=600): ...`; for a machine
+# RSUITEST_TIMEOUT_SCALE=2 (multiplies every value). A timeout passed to a function call wins over all of these.
+TIMEOUTS: dict[str, float] = {
+    # fixed limits
+    "find": 5, "dialog": 5, "press": 5, "log": 5,
+    # seconds without progress before a long step gives up
+    "stall": 5,
+    # ceilings of the long steps
+    "attach": 120, "tab": 60, "load_powerpac": 120, "controller": 300, "simulation": 120,
+    "save": 120, "shutdown": 120,
+}
+TIMEOUT_SCALE = float(os.environ.get("RSUITEST_TIMEOUT_SCALE") or 1)
+# Progress for the stall rule: RobotStudio and its virtual controllers together used at least this much CPU time (s)
+# since the last progress. An idle RobotStudio uses less (not verified on every machine; raise it if a hung
+# RobotStudio is taken for a busy one, lower it if a slow step is taken for a hung one).
+STALL_CPU = 0.25
+
+
+def limit(kind: str, value: float | None = None) -> float:
+    """`value` if given, else TIMEOUTS[kind] x TIMEOUT_SCALE."""
+    return value if value is not None else TIMEOUTS[kind] * TIMEOUT_SCALE
+
+
+@contextmanager
+def timeouts(**changes: float):
+    """Change TIMEOUTS for a block: `with timeouts(station_open=600, controller=300): ...`. Restored afterwards, also
+    on an error. An unknown name raises KeyError (a typo would otherwise change nothing)."""
+    old = {k: TIMEOUTS[k] for k in changes}
+    TIMEOUTS.update(changes)
+    try:
+        yield
+    finally:
+        TIMEOUTS.update(old)
+
+
+class Stalled(TimeoutError):
+    """RobotStudio showed no progress (CPU time, see STALL_CPU) for TIMEOUTS['stall'] seconds during a long step."""
+
+
+def activity() -> float:
+    """CPU seconds used so far by all RobotStudio and RobVC processes: grows while RobotStudio works."""
+    total = 0.0
+    for p in processes():
+        try:
+            t = p.cpu_times()
+            total += t.user + t.system
+        except psutil.Error:
+            pass
+    return total
 
 
 # ---------------------------------------------------------------- output: console + run.log, step table with timing
@@ -69,6 +129,7 @@ class Run:
     criteria: dict[str, list] = field(default_factory=dict)
     exceptions: list[str] = field(default_factory=list)   # 'Exception' rows seen by read_output
     output_reads: int = 0
+    started: float = field(default_factory=time.time)     # wall clock, to find RobotStudio's error logs of this run
 
     def __post_init__(self):
         self.report_dir.mkdir(parents=True, exist_ok=True)
@@ -108,6 +169,48 @@ class Run:
             except Exception as e2:  # noqa: BLE001
                 self.unexpected.append(f"no screenshot: {e2}")
 
+    def close_robotstudio(self, pid: int, **kwargs) -> bool:
+        """shutdown(pid, **kwargs) for a test's `finally`: an error is recorded under Unexpected instead of raised, so
+        finish() still writes result.md (2026-11-11 a close that failed in `finally` left no result.md). RobotStudio
+        stays open if a dialog stopped the close. Returns whether RobotStudio exited."""
+        try:
+            for answered in shutdown(pid, **kwargs):
+                NOTED.append(f"answered while closing: {answered}")
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.unexpected.append(f"RobotStudio {pid} not closed, left as it is: {type(e).__name__}: {e}")
+            print(f"   RobotStudio {pid} not closed: {e}")
+            return False
+
+    def robotstudio_errors(self) -> list[str]:
+        """Copy RobotStudio's error logs written during the run (ERROR_LOGS\\RobotStudio-*.rslog; RobotStudio writes
+        one only when something goes wrong) into the report and return one line per exception in them."""
+        out = []
+        for log in sorted(ERROR_LOGS.glob("RobotStudio-*.rslog")) if ERROR_LOGS.is_dir() else []:
+            try:
+                if log.stat().st_mtime < self.started:
+                    continue
+                shutil.copy2(log, self.report_dir / log.name)
+                lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError as e:
+                out.append(f"{log.name}: not readable ({e})")
+                continue
+            found = False
+            for i, line in enumerate(lines):
+                parts = line.split("|")
+                if len(parts) >= 4 and parts[1] == "Exception":
+                    msg = []                    # the message: the lines between '----EXCEPTION BEGIN----' and '   at'
+                    if i + 1 < len(lines) and lines[i + 1].startswith("----"):
+                        for m in lines[i + 2:]:
+                            if m.startswith("   at ") or m.startswith("----"):
+                                break
+                            msg.append(m.strip())
+                    out.append(f"{parts[3]} ({parts[4] if len(parts) > 4 else ''}): {' '.join(msg)} [{log.name}]")
+                    found = True
+            if not found:
+                out.append(f"{log.name} (no exception line; copied)")
+        return out
+
     def verdict(self) -> tuple[str, int]:
         """PASS (0) if every criterion is met; FAIL (1) if any was checked and not met; COULD NOT RUN (2) if some
         were never checked (a step could not be done) and none failed."""
@@ -137,6 +240,9 @@ class Run:
         if NOTED:
             lines += ["", "Noted, not part of the verdict (dialogs acknowledged automatically):",
                       *[f"- {n}" for n in NOTED]]
+        if rs_errors := self.robotstudio_errors():
+            lines += ["", "RobotStudio's own error log during the run (RobotStudio's code, not part of the verdict):",
+                      *[f"- {e}" for e in rs_errors]]
         (self.report_dir / "result.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         print("\n".join(lines))
 
@@ -212,26 +318,31 @@ def start_robotstudio(station: Path | None = None, sideload: bool = True) -> int
     return p.pid
 
 
-def attach(pid: int, timeout: float = 180):
-    """Attach to the RobotStudio process and wait for its main window (the one with a 'Home' ribbon tab)."""
+def attach(pid: int, timeout: float | None = None):
+    """Attach to the RobotStudio process and wait for its main window (the one with a 'Home' ribbon tab), as long as
+    RobotStudio shows progress (TIMEOUTS 'attach', 'stall'). Raises DialogAppeared (NoLicence for RobotStudio's
+    licence dialog) if a dialog blocks the main window."""
     import win32con
     import win32gui
-    app = Application(backend="uia").connect(process=pid, timeout=timeout)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    ceiling = limit("attach", timeout)
+    app = Application(backend="uia").connect(process=pid, timeout=ceiling)
+
+    def found():
         for w in Desktop(backend="uia").windows(process=pid):
             try:
                 if "RobotStudio" in w.window_text():
                     spec = app.window(handle=w.handle)
                     # Ribbon tab Names carry the mnemonic: '&Home', '&Add-Ins' (WinForms ribbon, not WPF).
                     if spec.child_window(title_re=r"^&?Home$", control_type="TabItem").exists(timeout=1):
-                        # A narrow window collapses ribbon groups, which hides their buttons from UIA.
-                        win32gui.ShowWindow(w.handle, win32con.SW_MAXIMIZE)
-                        return app, spec
+                        return w, spec
             except Exception:
                 pass
-        time.sleep(1)
-    raise TimeoutError(f"No RobotStudio main window with a Home tab within {timeout:.0f} s (PID {pid})")
+    w, spec = wait_until(found, ceiling, f"RobotStudio main window with a Home tab (PID {pid})", every=1, stall=True)
+    # A narrow window collapses ribbon groups, which hides their buttons from UIA.
+    win32gui.ShowWindow(w.handle, win32con.SW_MAXIMIZE)
+    if (d := modal_dialog(w)) is not None and not d.is_progress and not auto_answer(d):
+        raise dialog_error(d)
+    return app, spec
 
 
 # ---------------------------------------------------------------- elements
@@ -239,7 +350,20 @@ RIBBON_TYPES = ("Button", "SplitButton", "MenuItem", "ListItem", "TabItem")
 
 
 class DialogAppeared(RuntimeError):
-    """A modal dialog blocks RobotStudio while a wait was running; its text is in the message."""
+    """A modal dialog blocks RobotStudio while a wait was running; its text is in the message. RobotStudio is left as
+    it is, dialog open, for a person to see; `rsuitest-close` closes it afterwards."""
+
+
+class NoLicence(DialogAppeared):
+    """RobotStudio shows its licence dialog ('Access Application': Log In, Activate Node Locked License, Freemium,
+    Trial): no licence that starts add-ins (seen 2026-11-11 after a Trial licence expired)."""
+
+
+def dialog_error(d: "Dialog", prefix: str = "Dialog appeared: ") -> DialogAppeared:
+    """The exception for a dialog that stops a wait: NoLicence for RobotStudio's licence dialog."""
+    if "Access Application" in d.message or any("Node Locked License" in b for b in d.buttons):
+        return NoLicence(f"RobotStudio has no licence that starts add-ins (its licence dialog is open): {d}")
+    return DialogAppeared(prefix + str(d))
 
 
 # Dialogs answered automatically during any wait and while closing: substring of the message -> button. A test adds
@@ -247,24 +371,86 @@ class DialogAppeared(RuntimeError):
 # printed and kept in NOTED, which Run.finish lists apart from the verdict.
 AUTO_ANSWERS: dict[str, str] = {}
 NOTED: list[str] = []
-_DIALOG_CHECK_EVERY = 2.0
+_DIALOG_CHECK_EVERY = 1.0
+
+
+def _handle(window) -> int:
+    w = window.wrapper_object() if hasattr(window, "wrapper_object") else window
+    return w if isinstance(w, int) else w.handle
+
+
+def _top_windows(pid: int) -> list[int]:
+    """Visible top-level windows of the process (at least 20x20 px), front first. Win32 only, no UI Automation."""
+    import win32gui
+    import win32process
+    out: list[int] = []
+
+    def add(h, _):
+        try:
+            if win32gui.IsWindowVisible(h) and win32process.GetWindowThreadProcessId(h)[1] == pid:
+                left, top, right, bottom = win32gui.GetWindowRect(h)
+                if right - left >= 20 and bottom - top >= 20:
+                    out.append(h)
+        except Exception:
+            pass
+        return True
+    win32gui.EnumWindows(add, None)
+    return out
+
+
+def _read_dialog(h: int) -> "Dialog":
+    """A dialog window as text: title from Win32, message and buttons from UI Automation when it can read them (it
+    could not read RobotStudio's licence dialog while RobotStudio was closing, 2026-11-11)."""
+    import win32gui
+    from pywinauto.controls.uiawrapper import UIAWrapper
+    from pywinauto.uia_element_info import UIAElementInfo
+    title = win32gui.GetWindowText(h)
+    try:
+        w = UIAWrapper(UIAElementInfo(h))
+        buttons = [b.window_text() for b in w.descendants(control_type="Button") if b.window_text()]
+        texts = [t.window_text() for t in w.descendants(control_type="Text")
+                 if t.window_text() and t.window_text() not in buttons]
+        return Dialog(title or w.window_text(), " ".join(texts), buttons, w, h)
+    except Exception as e:  # noqa: BLE001
+        return Dialog(title, f"(text not readable through UI Automation: {type(e).__name__})", [], None, h)
+
+
+def modal_dialog(main) -> "Dialog | None":
+    """The modal dialog that blocks `main`, found through Win32 so that it is found also when UI Automation cannot
+    read it: a modal dialog disables its owner window. None if `main` is enabled, or disabled with no other enabled
+    window of the process in front (busy, not a dialog)."""
+    import win32gui
+    import win32process
+    h = _handle(main)
+    try:
+        if not win32gui.IsWindow(h) or win32gui.IsWindowEnabled(h):
+            return None
+        pid = win32process.GetWindowThreadProcessId(h)[1]
+        other = next((w for w in _top_windows(pid) if w != h and win32gui.IsWindowEnabled(w)), None)
+    except Exception:
+        return None
+    return None if other is None else _read_dialog(other)
 
 
 def watch_dialogs(target) -> None:
     """Raise DialogAppeared if a dialog of target's process is open that does not contain `target` itself (so
-    waiting inside a dialog is fine), after answering the ones listed in AUTO_ANSWERS."""
+    waiting inside a dialog is fine), after answering the ones listed in AUTO_ANSWERS. A modal dialog is found through
+    Win32 first (modal_dialog), then any dialog through UI Automation (dialogs)."""
     w = target.wrapper_object() if hasattr(target, "wrapper_object") else target
     own, p = set(), w
     while p is not None:                          # target and its ancestors: dialogs that contain it are expected
         own.add(p.handle)
         p = p.parent()
     top = w.top_level_parent()
-    for d in dialogs(w.process_id(), top):
-        if d.wrapper.handle in own or d.is_progress:
+    md = modal_dialog(top)
+    found = [md] if md is not None else []
+    found += [d for d in dialogs(w.process_id(), top) if md is None or d.handle != md.handle]
+    for d in found:
+        if d.handle in own or d.is_progress:
             continue
         if auto_answer(d):
             continue
-        raise DialogAppeared(f"Dialog appeared: {d}")
+        raise dialog_error(d)
 
 
 def auto_answer(d: "Dialog") -> bool:
@@ -280,30 +466,43 @@ def auto_answer(d: "Dialog") -> bool:
     return True
 
 
-def wait_until(cond, timeout: float, what: str, watch=None, every: float = 0.2):
+def wait_until(cond, timeout: float, what: str, watch=None, every: float = 0.2, stall: bool = False):
     """Call `cond()` until it returns something truthy, and return that; TimeoutError after `timeout` s (cond is
     always tried at least once). With `watch` (a window), a dialog that appears stops the wait at once
-    (watch_dialogs) instead of a timeout."""
-    deadline = time.monotonic() + timeout
-    next_check = time.monotonic() + _DIALOG_CHECK_EVERY
+    (watch_dialogs) instead of a timeout. With `stall` (long steps), Stalled as soon as RobotStudio shows no progress
+    (less than STALL_CPU s of CPU) for TIMEOUTS['stall'] s; `timeout` is then only a ceiling."""
+    start = time.monotonic()
+    deadline = start + timeout
+    next_check = start + _DIALOG_CHECK_EVERY
+    if stall:
+        cpu0, progress_at = activity(), start
     while True:
         if result := cond():
             return result
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if now > deadline:
             raise TimeoutError(f"{what}: not within {timeout:.0f} s")
-        if watch is not None and time.monotonic() >= next_check:
+        if stall:
+            cpu = activity()
+            if cpu - cpu0 >= STALL_CPU:
+                cpu0, progress_at = cpu, now
+            elif now - progress_at > limit("stall"):
+                raise Stalled(f"{what}: RobotStudio showed no progress for {now - progress_at:.0f} s "
+                              f"({cpu - cpu0:.2f} s CPU, progress needs {STALL_CPU} s); gave up after "
+                              f"{now - start:.0f} s")
+        if watch is not None and now >= next_check:
             watch_dialogs(watch)
             next_check = time.monotonic() + _DIALOG_CHECK_EVERY
         time.sleep(every)
 
 
-def click_until(control, done, what: str, unexpected: list[str] | None = None, timeout: float = 5):
+def click_until(control, done, what: str, unexpected: list[str] | None = None, timeout: float | None = None):
     """Click `control` and wait for `done()` to return something truthy (returned). A click right after a tab switch
     or a long action can be lost, so click once more; the retry is noted in `unexpected`."""
     for attempt in (1, 2):
         press(control, click=True)
         try:
-            return wait_until(done, timeout, what)
+            return wait_until(done, limit("press", timeout), what)
         except TimeoutError:
             if attempt == 2:
                 raise
@@ -312,7 +511,7 @@ def click_until(control, done, what: str, unexpected: list[str] | None = None, t
 
 
 def find(parent, title: str | None = None, title_re: str | None = None,
-         control_types: tuple[str | None, ...] = RIBBON_TYPES + (None,), timeout: float = 15):
+         control_types: tuple[str | None, ...] = RIBBON_TYPES + (None,), timeout: float | None = None):
     """Find a descendant by exact Name (title) or regex (title_re), trying the given control types in order.
     A None type means 'any type' (full tree scan: slow in RobotStudio, so keep it last). Stops on a dialog."""
     def first():
@@ -324,7 +523,7 @@ def find(parent, title: str | None = None, title_re: str | None = None,
                     return spec
             except Exception:
                 pass
-    return wait_until(first, timeout, f"{title or title_re} {control_types}", watch=parent, every=0.5)
+    return wait_until(first, limit("find", timeout), f"{title or title_re} {control_types}", watch=parent, every=0.5)
 
 
 _RIBBON_CACHE: dict[int, object] = {}   # main window handle -> the Ribbon pane's IUIAutomationElement
@@ -345,7 +544,8 @@ def _ribbon_element(main):
     return el
 
 
-def ribbon(main, names: str | tuple[str, ...], control_type: str, timeout: float = 15, required: bool = True):
+def ribbon(main, names: str | tuple[str, ...], control_type: str, timeout: float | None = None, required: bool = True,
+           stall: bool = False):
     """A control in the ribbon (tab, group Pane, button, dropdown) by exact Name, any of `names`. Searches from the
     Ribbon pane, found once per window and kept: ~30 ms per lookup instead of ~400 ms for a pywinauto lookup in the
     whole window (which also re-resolves any parent spec every time; measured 2026-10-25). Not for gallery items:
@@ -362,7 +562,7 @@ def ribbon(main, names: str | tuple[str, ...], control_type: str, timeout: float
         name_cond, iuia.iuia.CreatePropertyCondition(30003, iuia.known_control_types[control_type]))  # ControlType
     try:
         el = wait_until(lambda: _ribbon_element(main).FindFirst(4, cond),                # TreeScope_Descendants
-                        timeout, f"in the ribbon: {names} ({control_type})", watch=main)
+                        limit("find", timeout), f"in the ribbon: {names} ({control_type})", watch=main, stall=stall)
     except TimeoutError:
         if required:
             raise
@@ -393,13 +593,14 @@ def foreground(spec) -> None:
     raise RuntimeError("Could not bring RobotStudio to the front")
 
 
-def press(spec, timeout: float = 15, click: bool = False):
+def press(spec, timeout: float | None = None, click: bool = False):
     """Activate a control: its UIA pattern first (Invoke, then SelectionItem), a real click at its centre last.
     click=True: click only, for a button that opens a modal dialog (Invoke blocks until the dialog closes, minutes,
     then fails). A click hits screen coordinates, so the control's window is brought to the front first; otherwise
     the click lands in whatever window covers it.
     Each lookup searches RobotStudio's whole UIA tree (~0.4 s; spec.wait polls it, ~1.2 s), while the click itself
     takes 0.12 s (measured 2026-10-25), so resolve once and wait only if the control isn't there or enabled yet."""
+    timeout = limit("press", timeout)
     if not hasattr(spec, "wrapper_object"):   # already a wrapper (e.g. from ribbon())
         w = spec
         deadline = time.monotonic() + timeout
@@ -442,7 +643,7 @@ def press(spec, timeout: float = 15, click: bool = False):
     raise RuntimeError(f"Could not activate {w.window_text()!r}")
 
 
-def menu_item(main, menu: str, item: str, timeout: float = 15):
+def menu_item(main, menu: str, item: str, timeout: float | None = None):
     """Click `item` (a MenuItem, e.g. 'GalleryItem_ToolCreateWorkobject') in ribbon dropdown `menu`
     (e.g. 'CmdBarCtl_GalleryCreateMisc'). Clicking the dropdown toggles it, so open it only if the item isn't shown
     (the items stay in the UIA tree, invisible, after the dropdown closes)."""
@@ -467,7 +668,7 @@ def frame_size(main, size: str, unexpected: list[str] | None = None) -> None:
     wait_until(lambda: not is_open(), 3, f"Frame Size menu closed after {size}")
 
 
-def dialog(pid: int, title: str, timeout: float = 15, owner=None):
+def dialog(pid: int, title: str, timeout: float | None = None, owner=None):
     """A dialog window of the process: top-level, or (WinForms add-in modal dialogs) a child Window of `owner`, the main
     window. Raises DialogAppeared if a different dialog shows up instead."""
     specs = [Desktop(backend="uia").window(title=title, process=pid, found_index=0)]
@@ -482,8 +683,8 @@ def dialog(pid: int, title: str, timeout: float = 15, owner=None):
             except Exception:
                 pass
         if owner is not None and (other := [d for d in dialogs(pid, owner) if d.title != title and not d.is_progress]):
-            raise DialogAppeared(f"Waiting for {title!r}, but another dialog appeared: {other[0]}")
-    return wait_until(shown, timeout, f"dialog {title!r}", every=0)
+            raise dialog_error(other[0], f"Waiting for {title!r}, but another dialog appeared: ")
+    return wait_until(shown, limit("dialog", timeout), f"dialog {title!r}", every=0)
 
 
 # A group (Pane under RibbonTabContent) that only the tab of that name shows: the reliable "tab is selected" check,
@@ -491,22 +692,20 @@ def dialog(pid: int, title: str, timeout: float = 15, owner=None):
 TAB_GROUPS = {"Home": "Build Station", "Simulation": "Simulation Control", "Add-Ins": "PowerPacs"}   # a test project adds its own tab
 
 
-def tab(main, name: str, timeout: float = 30):
-    """Select ribbon tab `name` (a key of TAB_GROUPS: 'Home', 'Add-Ins', ...). Clicks are lost while RobotStudio is busy (e.g. a
-    station still starting its controller), so click until the tab's group is shown."""
+def tab(main, name: str, timeout: float | None = None):
+    """Select ribbon tab `name` (a key of TAB_GROUPS: 'Home', 'Add-Ins', ...). Clicks are lost while RobotStudio is
+    busy (e.g. a station still starting its controller), so click until the tab's group is shown, as long as
+    RobotStudio shows progress (TIMEOUTS 'tab' is the ceiling)."""
     t = ribbon(main, (f"&{name}", name), "TabItem")
     shown = lambda wait: ribbon(main, TAB_GROUPS[name], "Pane", timeout=wait, required=False)  # noqa: E731
-    deadline = time.monotonic() + timeout
-    while True:
+
+    def selected():
         if shown(0):
-            return t
+            return True
         press(t, click=True)
-        if shown(1):
-            return t
-        watch_dialogs(main)
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"Tab {name!r} not selected within {timeout:.0f} s")
-        time.sleep(1)
+        return shown(1)
+    wait_until(selected, limit("tab", timeout), f"Tab {name!r} selected", watch=main, every=1, stall=True)
+    return t
 
 
 def simulation_time(main) -> float | None:
@@ -519,13 +718,13 @@ def simulation_time(main) -> float | None:
     return float(m.group(1).replace(",", ".")) if m else None
 
 
-def simulation_play(main, timeout: float = 60) -> float:
+def simulation_play(main, timeout: float | None = None) -> float:
     """Simulation > Play; waits until the simulation time increases (the program runs). Returns the time seen."""
     tab(main, "Simulation")
     start = simulation_time(main) or 0.0
     press(ribbon(main, "CmdBarCtl_SimulationPlay", "Button"), click=True)
-    return wait_until(lambda: (t := simulation_time(main)) is not None and t > start + 0.5 and t, timeout,
-                      "simulation time to increase after Play")
+    return wait_until(lambda: (t := simulation_time(main)) is not None and t > start + 0.5 and t,
+                      limit("simulation", timeout), "simulation time to increase after Play", watch=main, stall=True)
 
 
 def simulation_stop(main) -> None:
@@ -538,7 +737,8 @@ def load_powerpac(main, tab_name: str, index: int = 0):
     """Add-Ins > PowerPacs > button `index` of the PowerPacs group; waits for the PowerPac's ribbon tab `tab_name`."""
     tab(main, "Add-Ins")
     press(ribbon(main, "PowerPacs", "Pane").children(control_type="Button")[index])
-    return ribbon(main, (f"&{tab_name}", tab_name), "TabItem", timeout=90)   # lazy PowerPac load
+    return ribbon(main, (f"&{tab_name}", tab_name), "TabItem",                # lazy PowerPac load
+                  timeout=limit("load_powerpac"), stall=True)
 
 
 def open_dialog(pid: int, main, button: str, title: str, unexpected: list[str] | None = None):
@@ -548,7 +748,8 @@ def open_dialog(pid: int, main, button: str, title: str, unexpected: list[str] |
             return dialog(pid, title, owner=main, timeout=0)
         except TimeoutError:
             return None
-    return click_until(ribbon(main, button, "Button"), opened, f"{button} opens {title!r}", unexpected, timeout=10)
+    return click_until(ribbon(main, button, "Button"), opened, f"{button} opens {title!r}", unexpected,
+                       timeout=limit("dialog"))
 
 
 def close_dialog(dlg, auto_id: str, unexpected: list[str] | None = None) -> None:
@@ -576,21 +777,22 @@ def open_station(main, path: Path) -> None:
     main.type_keys("^o")
     dlg = wait_until(lambda: next((c for c in main.wrapper_object().children()
                                    if c.element_info.class_name == "#32770" and c.window_text() == "Open"), None),
-                     15, "Open dialog")
+                     limit("dialog"), "Open dialog")
     edit = next(e for e in dlg.descendants(control_type="Edit") if e.element_info.automation_id == "1148")
     edit.set_edit_text(str(path))
     edit.type_keys("{ENTER}")
 
 
-def panel_button(main, panel: str, button: str, timeout: float = 15):
+def panel_button(main, panel: str, button: str, timeout: float | None = None):
     """A button (Create, Close, Clear) of a RobotStudio modeless panel such as 'Create Frame'. The outer Pane named
     `panel` holds the button row; there is another 'Close' elsewhere, so never search the whole window."""
     outer = find(main, title=panel, control_types=("Pane",), timeout=timeout)
     return find(outer, title=button, control_types=("Button",), timeout=timeout)
 
 
-def save(main, path: Path, timeout: float = 120) -> None:
-    """Ctrl+S, then wait until the station file is rewritten (mtime changes and stays put for 2 s)."""
+def save(main, path: Path, timeout: float | None = None) -> None:
+    """Ctrl+S, then wait until the station file is rewritten (mtime changes and stays put for 2 s), as long as
+    RobotStudio shows progress (TIMEOUTS 'save' is the ceiling)."""
     before = path.stat().st_mtime
     foreground(main)
     main.type_keys("^s")
@@ -601,7 +803,7 @@ def save(main, path: Path, timeout: float = 120) -> None:
             return False
         time.sleep(2)
         return path.stat().st_mtime == m
-    wait_until(written, timeout, f"{path.name} saved", watch=main, every=1)
+    wait_until(written, limit("save", timeout), f"{path.name} saved", watch=main, every=1, stall=True)
 
 
 @dataclass
@@ -609,7 +811,8 @@ class Dialog:
     title: str
     message: str
     buttons: list[str]
-    wrapper: object = field(repr=False)
+    wrapper: object = field(repr=False)   # None if UI Automation could not read the window (see _read_dialog)
+    handle: int = field(default=0, repr=False)
 
     def __str__(self):
         return f"[{self.title}] {self.message} {self.buttons}"
@@ -622,7 +825,9 @@ class Dialog:
 
     def answer(self, button: str) -> None:
         """Click `button`. click_input clicks screen coordinates, so the dialog's window must be in front first,
-        otherwise the click lands in whatever window covers it (seen 2026-10-25: the Claude app)."""
+        otherwise the click lands in whatever window covers it (seen 2026-10-25: another app's window)."""
+        if self.wrapper is None:
+            raise RuntimeError(f"Cannot answer {self}: UI Automation cannot read the dialog")
         b = next(c for c in self.wrapper.descendants(control_type="Button") if c.window_text() == button)
         foreground(self.wrapper.top_level_parent())
         b.click_input()
@@ -631,12 +836,20 @@ class Dialog:
 def dialogs(pid: int, main=None) -> list[Dialog]:
     """Open dialogs of the process, read as text: visible top-level windows other than the main window, and child
     Windows of the main window (add-in dialogs, RobotStudio's save prompt), each with at least one titled button.
-    Hidden 2x2 helper windows are skipped. Used to stop on, or answer, dialogs instead of timing out blind."""
+    Hidden 2x2 helper windows are skipped. Used to stop on, or answer, dialogs instead of timing out blind.
+    With `main`, a modal dialog that UI Automation cannot list is still returned (modal_dialog, through Win32);
+    if UI Automation fails altogether, that one alone is returned, or the UI Automation error is raised."""
     mw = None if main is None else main.wrapper_object() if hasattr(main, "wrapper_object") else main
     h = mw.handle if mw is not None else None
-    cands = [w for w in Desktop(backend="uia").windows(process=pid) if w.handle != h]
-    if mw is not None:
-        cands += [c for c in mw.children() if c.element_info.control_type == "Window"]
+    md = modal_dialog(mw) if mw is not None else None
+    try:
+        cands = [w for w in Desktop(backend="uia").windows(process=pid) if w.handle != h]
+        if mw is not None:
+            cands += [c for c in mw.children() if c.element_info.control_type == "Window"]
+    except Exception:
+        if md is not None:
+            return [md]
+        raise
     out = []
     for w in cands:
         try:
@@ -648,9 +861,11 @@ def dialogs(pid: int, main=None) -> list[Dialog]:
                 continue
             texts = [t.window_text() for t in w.descendants(control_type="Text")
                      if t.window_text() and t.window_text() not in buttons]
-            out.append(Dialog(w.window_text(), " ".join(texts), buttons, w))
+            out.append(Dialog(w.window_text(), " ".join(texts), buttons, w, w.handle))
         except Exception:
             pass
+    if md is not None and all(d.handle != md.handle for d in out):
+        out.insert(0, md)
     return out
 
 
@@ -665,28 +880,38 @@ def main_window(pid: int):
     return app, app.window(handle=w.handle)
 
 
-def shutdown(pid: int, discard: bool = False, terminate_vc: bool = False, timeout: float = 120) -> list[str]:
-    """Close RobotStudio through its own UI and wait for the process to exit. Answers 'unsaved changes' with No only
-    if discard, and 'virtual controllers are running ... terminated?' with Yes only if terminate_vc; any other dialog
-    raises with its text. Returns what was answered."""
+def shutdown(pid: int, discard: bool = False, terminate_vc: bool = False, timeout: float | None = None) -> list[str]:
+    """Close RobotStudio through its own UI and wait for the process to exit, as long as it shows progress (TIMEOUTS
+    'shutdown' is the ceiling). Answers 'unsaved changes' with No only if discard, and 'virtual controllers are
+    running ... terminated?' with Yes only if terminate_vc. Any other dialog, one open before closing included, raises
+    with its text and leaves RobotStudio open as it is, for a person to see (`rsuitest-close` afterwards): closing the
+    main window behind RobotStudio's licence dialog, 9 s after start, made RobotStudio throw in its own code and end
+    in 'RobotStudio - fatal error' (2026-11-11). Also raises, instead of waiting, when the dialogs cannot be read
+    three times in a row. Returns what was answered."""
     import win32con
     import win32gui
     app, main = main_window(pid)
     h = main.wrapper_object().handle
-    done, last_error = [], None
+    if (md := modal_dialog(main)) is not None and not md.is_progress and not auto_answer(md):
+        raise dialog_error(md, f"Not closing RobotStudio {pid}, a dialog is open (left open): ")
+    done, read_errors = [], 0
     # WM_CLOSE = the window's X button. UIA WindowPattern.Close() was ignored by an idle RobotStudio (2026-10-25).
     win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
-    deadline = time.monotonic() + timeout
-    resend = time.monotonic() + 15
+    start = time.monotonic()
+    deadline = start + limit("shutdown", timeout)
+    resend = start + limit("stall") / 2
+    cpu0, progress_at = activity(), start
     # psutil, not app.is_process_running(): that said "exited" 1.5 s after WM_CLOSE while the process still ran.
     while psutil.pid_exists(pid):
-        if time.monotonic() > resend and win32gui.IsWindow(h):
-            win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)   # ignored while busy (e.g. still loading): again
-            resend = time.monotonic() + 15
         try:
             open_dialogs = dialogs(pid, main)
+            read_errors = 0
         except Exception as e:   # e.g. the main window is gone while the process exits
-            open_dialogs, last_error = [], f"{type(e).__name__}: {e}"
+            open_dialogs = []
+            read_errors += 1
+            if read_errors >= 3 and psutil.pid_exists(pid):
+                raise RuntimeError(f"RobotStudio {pid} did not exit and its dialogs cannot be read "
+                                   f"({type(e).__name__}: {e}); stopped waiting, RobotStudio left as it is") from e
         for d in open_dialogs:
             if d.is_progress or auto_answer(d):
                 continue
@@ -695,12 +920,21 @@ def shutdown(pid: int, discard: bool = False, terminate_vc: bool = False, timeou
             elif "virtual controllers are running" in d.message and terminate_vc and "Yes" in d.buttons:
                 d.answer("Yes")
             else:
-                raise RuntimeError(f"Dialog while closing: {d}")
+                raise dialog_error(d, f"Dialog while closing RobotStudio {pid} (left open): ")
             done.append(str(d))
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"RobotStudio {pid} did not exit within {timeout:.0f} s "
-                               f"(last error reading dialogs: {last_error})")
-        time.sleep(1)
+        now = time.monotonic()
+        if now > deadline:
+            raise TimeoutError(f"RobotStudio {pid} did not exit within {deadline - start:.0f} s")
+        cpu = activity()
+        if cpu - cpu0 >= STALL_CPU:
+            cpu0, progress_at = cpu, now
+        elif now - progress_at > limit("stall"):
+            raise Stalled(f"RobotStudio {pid} did not exit and showed no progress for {now - progress_at:.0f} s; "
+                          "stopped waiting, RobotStudio left as it is")
+        if now > resend and win32gui.IsWindow(h) and win32gui.IsWindowEnabled(h):
+            win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)   # ignored while busy (e.g. still loading): again
+            resend = now + limit("stall") / 2
+        time.sleep(0.5)
     # Its virtual controller normally stops shortly after; wait for that, so the next start finds nothing running.
     # One whose start failed (see wait_controllers_ready) stays: end it, as RobotStudio's "terminate?" prompt would.
     vc_deadline = time.monotonic() + 30
@@ -717,7 +951,7 @@ def shutdown(pid: int, discard: bool = False, terminate_vc: bool = False, timeou
 
 
 def text(parent, auto_id: str) -> str:
-    return parent.child_window(auto_id=auto_id).wait("exists", timeout=5).window_text()
+    return parent.child_window(auto_id=auto_id).wait("exists", timeout=limit("find")).window_text()
 
 
 def shot(wrapper_or_spec, path: Path) -> str:
@@ -773,14 +1007,15 @@ def output_rows(main) -> list[str]:
     return rows
 
 
-def wait_controllers_ready(main, timeout: float = 180) -> str:
+def wait_controllers_ready(main, timeout: float | None = None) -> str:
     """Wait until the station's virtual controller has started and is mapped to the station: its event log is
     mirrored into the Output window (rows with category 'Event Log'). It starts in the background after the station
     opens. Acting before that (e.g. an add-in's dialog that changes the station) races its start-up: RobotStudio then throws 'DeltaState is
     not open' in StationVcMapper.PostRestartHandling and shows 'There was a problem with the virtual controller'
     (2026-10-25, ErrorLogs). Only for stations with a controller. Returns the first Event Log row."""
     return wait_until(lambda: next((r for r in output_rows(main) if r.endswith("| Event Log")), None),
-                      timeout, "virtual controller event in the Output window", watch=main, every=2)
+                      limit("controller", timeout), "virtual controller event in the Output window", watch=main,
+                      every=2, stall=True)
 
 
 LogMark = tuple[str | None, int]   # (raw first line, timestamp included; number of lines)
@@ -818,11 +1053,12 @@ def log_after(path: Path, mark: LogMark) -> list[str]:
     return _strip(raw[count:])
 
 
-def wait_log(path: Path, mark: LogMark, text: str, count: int = 1, timeout: float = 10) -> list[str]:
+def wait_log(path: Path, mark: LogMark, text: str, count: int = 1, timeout: float | None = None) -> list[str]:
     """Wait until `count` lines after `mark` contain `text` (they can come seconds after the click), then return
-    all lines after `mark`. Returns them anyway after `timeout`: the caller's criterion decides."""
+    all lines after `mark`. Returns them anyway after `timeout` (TIMEOUTS 'log'): the caller's criterion decides."""
     try:
-        wait_until(lambda: sum(text in l for l in log_after(path, mark)) >= count, timeout, text, every=0.5)
+        wait_until(lambda: sum(text in l for l in log_after(path, mark)) >= count, limit("log", timeout), text,
+                   every=0.5)
     except TimeoutError:
         pass
     return log_after(path, mark)

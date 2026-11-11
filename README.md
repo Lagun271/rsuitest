@@ -180,9 +180,8 @@ asked; a terminal `claude` on Windows has no computer use).
   is found through Win32 (it disables its owner window), so also when UI Automation cannot read it.
 - **RobotStudio is left as it is** when a test stops on a dialog: `shutdown()` refuses to close behind an open
   dialog and stops if a dialog it does not expect appears while closing. In a test's `finally`, use
-  `run.close_robotstudio(pid)`: it records such an error instead of raising it, so `result.md` is still written. Closing the main window behind a modal
-  dialog during start-up made RobotStudio throw in its own code and end in "RobotStudio - fatal error". Close it
-  afterwards with `rsuitest-close` (`run.ps1 close`), after looking.
+  `run.close_robotstudio(pid)`: it records such an error instead of raising it, so `result.md` is still written.
+  Close RobotStudio afterwards with `rsuitest-close` (`run.ps1 close`), after looking.
 - **Timeouts are short.** Lookups, dialogs and clicks give up after 5 s. The long steps (`attach`, `tab`,
   `load_powerpac`, `wait_controllers_ready`, `simulation_play`, `save`, `shutdown`) wait as long as RobotStudio
   shows progress and give up after 5 s without any (`Stalled`); progress is CPU time used by RobotStudio and its
@@ -238,8 +237,14 @@ Verified with RobotStudio 2026.4; read before writing a test.
 - **RobotStudio's licence dialogs** appear over the main window after start when there is no licence: "Access
   Application" (Log In, Activate Node Locked License, Freemium, Trial) or "Your Free Trial Has Ended." (View My
   Cloud Projects, Request License, Cancel). UI Automation read them during start-up but not while RobotStudio was
-  closing (`COMError`). Their own Cancel / ✕ ends RobotStudio cleanly; `WM_CLOSE` to the main window behind them
-  made it crash.
+  closing (`COMError`): "Access Application" is a WebView2 page. Their own Cancel / ✕ ends RobotStudio cleanly.
+- **Never send `WM_CLOSE` to a disabled main window.** While a modal dialog is open the main window is disabled, so a
+  person cannot close it; `PostMessage(WM_CLOSE)` can. RobotStudio shows its licence dialog in the middle of its
+  start-up (`Program.LateInit`). `WM_CLOSE` to the main window behind it (at 3 s or 22 s alike) disposed the
+  window; the rest of the start-up then threw `ObjectDisposedException` (`ToolBar`, from `NotificationCenter.Setup`
+  or `UserService_StatusChanged`) and RobotStudio ended in "RobotStudio - fatal error". With the dialog shown after
+  the start-up ("Your Free Trial Has Ended."), the same `WM_CLOSE` closed RobotStudio cleanly. `shutdown()` therefore
+  closes only an enabled main window, as a person would.
 - **Never kill RobotStudio.** Its virtual controller (`RobVC.exe`) survives, and the next RobotStudio asks whether to
   terminate it. `shutdown()` / `rsuitest-close` close through the UI (`WM_CLOSE`; UIA `Close()` was ignored).
 - **Never UIA-`Invoke` a button that opens a modal dialog**: it blocks until the dialog closes, then fails. Use

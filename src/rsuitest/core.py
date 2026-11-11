@@ -888,10 +888,14 @@ def shutdown(pid: int, discard: bool = False, terminate_vc: bool = False, timeou
     """Close RobotStudio through its own UI and wait for the process to exit, as long as it shows progress (TIMEOUTS
     'shutdown' is the ceiling). Answers 'unsaved changes' with No only if discard, and 'virtual controllers are
     running ... terminated?' with Yes only if terminate_vc. Any other dialog, one open before closing included, raises
-    with its text and leaves RobotStudio open as it is, for a person to see (`rsuitest-close` afterwards): closing the
-    main window behind RobotStudio's licence dialog, 9 s after start, made RobotStudio throw in its own code and end
-    in 'RobotStudio - fatal error' (2026-11-11). Also raises, instead of waiting, when the dialogs cannot be read
-    three times in a row. Returns what was answered."""
+    with its text and leaves RobotStudio open as it is, for a person to see (`rsuitest-close` afterwards).
+    WM_CLOSE is never sent while the main window is disabled (a modal dialog is open): a person cannot close it then,
+    and PostMessage would. RobotStudio shows its licence dialog in the middle of its start-up (Program.LateInit);
+    WM_CLOSE to the main window behind it, at 3 s or 22 s alike, disposed the window, and the rest of the start-up
+    then threw ObjectDisposedException (ToolBar, from NotificationCenter.Setup or UserService_StatusChanged) and
+    ended in 'RobotStudio - fatal error' (reproduced 2026-11-11). The dialog's own Cancel / ✕ ends RobotStudio
+    cleanly. Also raises, instead of waiting, when the dialogs cannot be read three times in a row. Returns what was
+    answered."""
     import win32con
     import win32gui
     app, main = main_window(pid)

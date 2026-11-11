@@ -29,22 +29,19 @@ writes a report. Each test declares success criteria; the verdict is about those
 
 ## Installation
 
-Pin to a tag. uv and pip need `git` on the machine to install from a git URL.
+Pin to a version. Not on PyPI; each [release](https://github.com/Lagun271/rsuitest/releases) has the wheel attached,
+which needs nothing but HTTPS (no git):
+
+```toml
+dependencies = ["rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.1.0/rsuitest-0.1.0-py3-none-any.whl"]
+```
+
+or with pip: `pip install https://github.com/Lagun271/rsuitest/releases/download/v0.1.0/rsuitest-0.1.0-py3-none-any.whl`.
+
+From the tag with git instead (uv and pip then need `git` on the machine):
 
 ```powershell
 uv add "git+https://github.com/Lagun271/rsuitest" --tag v0.1.0
-```
-
-or in `pyproject.toml`:
-
-```toml
-dependencies = ["rsuitest @ git+https://github.com/Lagun271/rsuitest@v0.1.0"]
-```
-
-or with pip:
-
-```powershell
-pip install "git+https://github.com/Lagun271/rsuitest@v0.1.0"
 ```
 
 ### Self-contained test folder (template in `scripts/`)
@@ -55,10 +52,10 @@ description):
 
 | File | What |
 |---|---|
-| `setup.ps1` | One-time: downloads uv into `.uv\`, Python into `.python\` (version from `.python-version`), creates `.venv\` and installs `pyproject.toml`'s dependencies. Needs internet and git. |
+| `setup.ps1` | One-time: downloads uv into `.uv\`, Python into `.python\` (version from `.python-version`), creates `.venv\` and installs `pyproject.toml`'s dependencies. Needs internet; git only for a `git+https` dependency. |
 | `env.ps1` | Keeps every uv path inside the folder (`UV_PYTHON_INSTALL_DIR`, `UV_CACHE_DIR`, `UV_PROJECT_ENVIRONMENT`, `UV_PYTHON_PREFERENCE=only-managed`); nothing is written to the user profile or `PATH`. |
 | `run.ps1`, `run.cmd` | `run.ps1 <name> [-- args]` runs `<name>.py` from the folder, or `python -m rsuitest.<name>` if there is no such file (`run.ps1 status`, `close`, `dump_tree`, `pim`). Runs `setup.ps1` first if there is no `.venv\`. |
-| `pyproject.toml`, `.python-version` | The project, with rsuitest pinned to a tag; Python 3.12. |
+| `pyproject.toml`, `.python-version` | The project, with rsuitest pinned to a release wheel; Python 3.12. |
 | `.gitignore` | The toolchain folders and `reports\`. |
 
 ## Example
@@ -148,8 +145,10 @@ Find the names to target with `.\run.ps1 dump_tree` (or `rsuitest-dump-tree`) wh
 - **Add-in specific** (its tab, dialogs, log file, version): in the test project's own module (`myaddin.py` in the
   example), not here.
 - Release: raise `version` in `pyproject.toml` and `__version__` in `src/rsuitest/__init__.py` as described in
-  "Versioning", commit, tag `vX.Y.Z`, push the tag. Projects move their pin to the new tag
-  (`uv add ... --tag vX.Y.Z`).
+  "Versioning", commit, push, then tag `vX.Y.Z` and push the tag. The `release` workflow
+  (`.github/workflows/release.yml`) checks that tag and versions agree, builds the wheel and sdist, installs the
+  wheel and imports it, and creates the GitHub Release with both files and their SHA-256. Projects then move their
+  pin to the new version.
 
 ## Writing tests with Claude Code and computer use
 
@@ -256,7 +255,7 @@ moving the pin: after a patch, run the tests; after a minor (before 1.0) or majo
 - The 3D view is not in the UIA tree. Check results in the saved station (`rsuitest.pim`) or leave that step to a
   person.
 - `frame_size()` clicks by position inside the popup.
-- No PyPI release; install from git with a tag.
+- No PyPI release; install the wheel from a GitHub Release, or from git with a tag.
 
 ## Licence
 

@@ -1,11 +1,11 @@
-# Template: the test project's own pyproject.toml. Change name and description; keep rsuitest pinned to a tag.
+# Template: the test project's own pyproject.toml. Change name and description; keep rsuitest pinned to a release.
 [project]
 name = "my-addin-uitest"
 version = "0.1.0"
 description = "UI tests of my RobotStudio add-in"
 requires-python = ">=3.12"
 dependencies = [
-    "rsuitest @ git+https://github.com/Lagun271/rsuitest@v0.1.0",
+    "rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.1.0/rsuitest-0.1.0-py3-none-any.whl",
 ]
 
 [tool.uv]

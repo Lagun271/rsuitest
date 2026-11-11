@@ -1,0 +1,60 @@
+# Copyright (c) 2026 Lagun 271 AB. MIT licence, see LICENSE.md at https://github.com/Lagun271/rsuitest.
+# On a pushed tag vX.Y.Z: check the version, build wheel + sdist, install the wheel and import it, then create the
+# GitHub Release vX.Y.Z with both files and their SHA-256. Windows, because the dependencies (pywin32) are Windows-only.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Tag, pyproject.toml and __version__ agree
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          proj=$(sed -n 's/^version = "\(.*\)"\r\?$/\1/p' pyproject.toml | head -1)
+          init=$(sed -n 's/^__version__ = "\(.*\)"\r\?$/\1/p' src/rsuitest/__init__.py)
+          echo "tag $tag, pyproject.toml $proj, __version__ $init"
+          [ "$tag" = "$proj" ] && [ "$tag" = "$init" ] || { echo "::error::version mismatch"; exit 1; }
+
+      - name: Build
+        run: uv build --out-dir dist
+
+      - name: Install the wheel in a clean environment and import it
+        run: |
+          uv run --isolated --no-project --python 3.12 --with dist/*.whl \
+            python -c "import rsuitest, rsuitest.core, rsuitest.pim; assert rsuitest.__version__ == '${GITHUB_REF_NAME#v}'; print('OK', rsuitest.__version__)"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          whl="rsuitest-$v-py3-none-any.whl"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$whl"
+          {
+            echo "Install without git, from the wheel attached here:"
+            echo
+            echo '```toml'
+            echo "dependencies = [\"rsuitest @ $url\"]"
+            echo '```'
+            echo
+            echo "or from the tag with git: \`uv add \"git+https://github.com/${GITHUB_REPOSITORY}\" --tag ${GITHUB_REF_NAME}\`."
+            echo
+            echo "SHA-256:"
+            (cd dist && sha256sum -- * | sed 's/^\([0-9a-f]*\) [ *]\?\(.*\)$/- `\2`: `\1`/')
+          } > notes.md
+          cat notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "rsuitest $v" --notes-file notes.md dist/*

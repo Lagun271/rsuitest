@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Lagun 271 AB. MIT licence, see LICENSE.md at https://github.com/Lagun271/rsuitest.
 # One-time setup, fully self-contained: downloads uv into .uv\, a Python into .python\ (version from .python-version),
 # creates .venv\ and installs the dependencies in pyproject.toml (rsuitest and through it pywinauto, pillow, psutil).
-# Re-running is harmless. Needs internet (astral.sh, github.com) and, for a git dependency such as rsuitest, git.
+# Re-running is harmless. Needs internet (astral.sh, github.com, pypi.org); git only for a git+https dependency.
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\env.ps1"
 $uv = "$PSScriptRoot\.uv\uv.exe"

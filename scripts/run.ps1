@@ -8,6 +8,6 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\env.ps1"
 if (-not (Test-Path "$PSScriptRoot\.venv")) { & "$PSScriptRoot\setup.ps1" }
 $Rest = @($Rest | Where-Object { $_ -and $_ -ne '--' })
-$target = if (Test-Path "$PSScriptRoot\$Test.py") { @("$PSScriptRoot\$Test.py") } else { @('-m', "rsuitest.$Test") }
+[string[]]$target = if (Test-Path "$PSScriptRoot\$Test.py") { @("$PSScriptRoot\$Test.py") } else { @('-m', "rsuitest.$Test") }
 Push-Location $PSScriptRoot
 try { & "$PSScriptRoot\.uv\uv.exe" run python @target @Rest; exit $LASTEXITCODE } finally { Pop-Location }

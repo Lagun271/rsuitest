@@ -1,0 +1,33 @@
+[project]
+name = "rsuitest"
+version = "0.1.0"
+description = "UI Automation test helpers for RobotStudio 2026 add-ins (pywinauto), and a reader for saved stations (PIM.xml)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.md"]
+authors = [{ name = "Lagun 271 AB" }]
+requires-python = ">=3.12"
+dependencies = [
+    "pywinauto>=0.6.9",
+    "pywin32>=306",
+    "pillow>=10",
+    "psutil>=5.9",
+]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Repository = "https://github.com/Lagun271/rsuitest"
+
+[project.scripts]
+rsuitest-status = "rsuitest.status:main"
+rsuitest-close = "rsuitest.close:main"
+rsuitest-dump-tree = "rsuitest.dump_tree:main"
+rsuitest-pim = "rsuitest.pim:main"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"

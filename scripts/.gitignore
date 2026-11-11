@@ -1,0 +1,8 @@
+# Local toolchain and run output: created by setup.ps1 / run.ps1, never committed.
+.uv/
+.uv-cache/
+.uv-tools/
+.python/
+.venv/
+__pycache__/
+reports/

@@ -123,6 +123,54 @@ sys.exit(code)
 
 Find the names to target with `.\run.ps1 dump_tree` (or `rsuitest-dump-tree`) while RobotStudio runs.
 
+## Writing a new test
+
+1. Write down what the test proves as success criteria (`run.declare(A1=..., A2=...)`) before the steps. The steps
+   are only the means; a step that cannot be done leaves its criteria "not checked" (COULD NOT RUN), not FAIL.
+2. Start RobotStudio by hand (or with a test and `--keep`), bring it to the state of the step, and run
+   `.\run.ps1 dump_tree` (`-- --title "<dialog title>"` for a dialog). Grep `reports\tree-*.txt` for the Names,
+   `AutomationId`s and control types. Add-in dialogs: the ids are the WinForms `Control.Name`s in the
+   `*.Designer.cs` files.
+3. Copy an existing test and keep its frame: `Run`, one `with run.step(...)` per step, `run.check` for each criterion,
+   `run.error` in `except`, `shutdown` in `finally`, `sys.exit(code)`.
+4. Prefer checks on text (labels, the Output window, the add-in's log file via `log_mark`/`wait_log`) and on the saved
+   station (`rsuitest.pim`) over screenshots. Screenshots are evidence for a person, not the check.
+5. Dialogs that are unrelated to what the test checks go into `AUTO_ANSWERS` (listed under "Noted"); any other dialog
+   stops the run with its text.
+
+## Adding a helper
+
+- **Generic** (works for any add-in, only RobotStudio's own UI): add it to `rsuitest.core` in this repo. Find
+  targets by UIA name, id and type, never by coordinates; wait with `wait_until(..., watch=main)` so a dialog stops
+  the wait; never `Invoke` a button that opens a modal dialog. The docstring says what it does and what was observed
+  that made it so (with the date), and names no add-in, customer or machine. A new fact about RobotStudio's UIA tree
+  goes into "RobotStudio 2026 UIA facts" below.
+- **Add-in specific** (its tab, dialogs, log file, version): in the test project's own module (`myaddin.py` in the
+  example), not here.
+- Release: raise `version` in `pyproject.toml` and `__version__` in `src/rsuitest/__init__.py`, commit, tag
+  `vX.Y.Z`, push the tag. Projects move their pin to the new tag (`uv add ... --tag vX.Y.Z`).
+
+## Writing tests with Claude Code and computer use
+
+The tests are written to be developed by an AI coding agent such as Claude Code, in a session that has both a shell
+and computer use (in the Claude desktop app: Settings > This computer > Computer use, then approve RobotStudio when
+asked; a terminal `claude` on Windows has no computer use).
+
+- **Give the agent this README.** The "UIA facts" are the rules it needs: RobotStudio in front, never kill it, never
+  `Invoke` a button that opens a modal dialog, one RobotStudio at a time, success criteria first.
+- **Explore with screenshots, automate with UIA.** The agent may look at RobotStudio by screenshot to understand a
+  step, then uses `dump_tree` to find the UIA names and writes the step as code. Everything that is a tab, button,
+  dialog, label or list belongs in the script: deterministic, milliseconds per step, checked on text.
+- **Run, read, fix.** The agent runs `.\run.ps1 tc_<name>`, reads `result.md`, `run.log` and the screenshots, and
+  fixes the test. `rsuitest-status` shows what is running and any open dialog as text; `rsuitest-close` closes
+  RobotStudio cleanly between attempts.
+- **Handoff steps.** What UIA cannot reach (the 3D view: compare sizes by eye, pick a point in the graphics) becomes
+  a handoff point: the script prints what to do and waits for a flag file such as `<report>\step04.done`; the agent
+  does the step by screenshot and click, creates the file, and the script continues. Prefer typed values in dialogs
+  over clicks in the graphics, and checks in the saved station over looking.
+- **Never both at once.** While a script runs, the agent (and you) keep the mouse and keyboard untouched; computer
+  use acts only at a handoff point, when the script waits.
+
 ## Report format
 
 Each `Run` writes to its report folder:

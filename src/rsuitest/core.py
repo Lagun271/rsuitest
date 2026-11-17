@@ -45,8 +45,9 @@ ERROR_LOGS = Path(os.environ.get("ProgramData") or r"C:\ProgramData") / "ABB" / 
 TIMEOUTS: dict[str, float] = {
     # fixed limits
     "find": 5, "dialog": 5, "press": 5, "log": 5,
-    # seconds without progress before a long step gives up
-    "stall": 5,
+    # seconds without progress before a long step gives up; closing has its own, longer one: RobotStudio waits for its
+    # virtual controller to stop while using little CPU (a close after a running simulation stalled at 5 s, 2026-11-17)
+    "stall": 5, "stall_close": 30,
     # ceilings of the long steps
     "attach": 120, "tab": 60, "load_powerpac": 120, "controller": 300, "simulation": 120,
     "save": 120, "shutdown": 120,
@@ -304,7 +305,8 @@ def start_robotstudio(station: Path | None = None, sideload: bool = True) -> int
     sideloaded, optionally opening `station`. Returns the PID.
     sideload=False: no /addin, and the add-in's .rspak must be installed instead (tests of the installed package)."""
     if procs := processes():
-        raise SystemExit(f"Already running: {[(p.info['name'], p.pid) for p in procs]}; `run.ps1 close` first. "
+        raise SystemExit(f"Already running: {[(p.info['name'], p.pid) for p in procs]}; close it first if it is yours "
+                         "(`rsuitest-close --pid <PID>`). "
                          "(A leftover RobVC makes RobotStudio ask whether to terminate it.)")
     inst = installed_packages()
     if sideload and inst:
@@ -353,7 +355,7 @@ RIBBON_TYPES = ("Button", "SplitButton", "MenuItem", "ListItem", "TabItem")
 
 class DialogAppeared(RuntimeError):
     """A modal dialog blocks RobotStudio while a wait was running; its text is in the message. RobotStudio is left as
-    it is, dialog open, for a person to see; `rsuitest-close` closes it afterwards."""
+    it is, dialog open, for a person to see; `rsuitest-close --pid <PID>` closes it afterwards."""
 
 
 class NoLicence(DialogAppeared):
@@ -888,7 +890,7 @@ def shutdown(pid: int, discard: bool = False, terminate_vc: bool = False, timeou
     """Close RobotStudio through its own UI and wait for the process to exit, as long as it shows progress (TIMEOUTS
     'shutdown' is the ceiling). Answers 'unsaved changes' with No only if discard, and 'virtual controllers are
     running ... terminated?' with Yes only if terminate_vc. Any other dialog, one open before closing included, raises
-    with its text and leaves RobotStudio open as it is, for a person to see (`rsuitest-close` afterwards).
+    with its text and leaves RobotStudio open as it is, for a person to see (`rsuitest-close --pid <PID>` afterwards).
     WM_CLOSE is never sent while the main window is disabled (a modal dialog is open): a person cannot close it then,
     and PostMessage would. RobotStudio shows its licence dialog in the middle of its start-up (Program.LateInit);
     WM_CLOSE to the main window behind it, at 3 s or 22 s alike, disposed the window, and the rest of the start-up
@@ -936,13 +938,14 @@ def shutdown(pid: int, discard: bool = False, terminate_vc: bool = False, timeou
         cpu = activity()
         if cpu - cpu0 >= STALL_CPU:
             cpu0, progress_at = cpu, now
-        elif now - progress_at > limit("stall"):
+        elif now - progress_at > limit("stall_close"):
             raise Stalled(f"RobotStudio {pid} did not exit and showed no progress for {now - progress_at:.0f} s; "
                           "stopped waiting, RobotStudio left as it is")
         if now > resend and win32gui.IsWindow(h) and win32gui.IsWindowEnabled(h):
             win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)   # ignored while busy (e.g. still loading): again
             resend = now + limit("stall") / 2
         time.sleep(0.5)
+    print(f"   RobotStudio {pid} exited {time.monotonic() - start:.1f} s after WM_CLOSE")
     # Its virtual controller normally stops shortly after; wait for that, so the next start finds nothing running.
     # One whose start failed (see wait_controllers_ready) stays: end it, as RobotStudio's "terminate?" prompt would.
     vc_deadline = time.monotonic() + 30

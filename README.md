@@ -34,15 +34,15 @@ Pin to a version. Not on PyPI; each [release](https://github.com/Lagun271/rsuite
 which needs nothing but HTTPS (no git):
 
 ```toml
-dependencies = ["rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.2.0/rsuitest-0.2.0-py3-none-any.whl"]
+dependencies = ["rsuitest @ https://github.com/Lagun271/rsuitest/releases/download/v0.3.0/rsuitest-0.3.0-py3-none-any.whl"]
 ```
 
-or with pip: `pip install https://github.com/Lagun271/rsuitest/releases/download/v0.2.0/rsuitest-0.2.0-py3-none-any.whl`.
+or with pip: `pip install https://github.com/Lagun271/rsuitest/releases/download/v0.3.0/rsuitest-0.3.0-py3-none-any.whl`.
 
 From the tag with git instead (uv and pip then need `git` on the machine):
 
 ```powershell
-uv add "git+https://github.com/Lagun271/rsuitest" --tag v0.2.0
+uv add "git+https://github.com/Lagun271/rsuitest" --tag v0.3.0
 ```
 
 ### Self-contained test folder (template in `scripts/`)
@@ -163,8 +163,9 @@ asked; a terminal `claude` on Windows has no computer use).
   step, then uses `dump_tree` to find the UIA names and writes the step as code. Everything that is a tab, button,
   dialog, label or list belongs in the script: deterministic, milliseconds per step, checked on text.
 - **Run, read, fix.** The agent runs `.\run.ps1 tc_<name>`, reads `result.md`, `run.log` and the screenshots, and
-  fixes the test. `rsuitest-status` shows what is running and any open dialog as text; `rsuitest-close` closes
-  RobotStudio cleanly between attempts.
+  fixes the test. `rsuitest-status` shows what is running and any open dialog as text; `rsuitest-close --pid <PID>`
+  closes the RobotStudio the test started (its PID is in `run.log`) cleanly between attempts. Never close a
+  RobotStudio someone else is working in.
 - **Handoff steps.** What UIA cannot reach (the 3D view: compare sizes by eye, pick a point in the graphics) becomes
   a handoff point: the script prints what to do and waits for a flag file such as `<report>\step04.done`; the agent
   does the step by screenshot and click, creates the file, and the script continues. Prefer typed values in dialogs
@@ -181,11 +182,15 @@ asked; a terminal `claude` on Windows has no computer use).
 - **RobotStudio is left as it is** when a test stops on a dialog: `shutdown()` refuses to close behind an open
   dialog and stops if a dialog it does not expect appears while closing. In a test's `finally`, use
   `run.close_robotstudio(pid)`: it records such an error instead of raising it, so `result.md` is still written.
-  Close RobotStudio afterwards with `rsuitest-close` (`run.ps1 close`), after looking.
+  Close RobotStudio afterwards with `rsuitest-close --pid <PID>` (`run.ps1 close -- --pid <PID>`), after looking.
+- **Only what you started.** `rsuitest-close` closes nothing without `--pid <PID>` (repeatable) or `--all`; on its
+  own it lists what is running. Everything else works on the PID the test started, and `start_robotstudio` refuses
+  while any RobotStudio runs, so a test never touches a RobotStudio someone is working in.
 - **Timeouts are short.** Lookups, dialogs and clicks give up after 5 s. The long steps (`attach`, `tab`,
-  `load_powerpac`, `wait_controllers_ready`, `simulation_play`, `save`, `shutdown`) wait as long as RobotStudio
-  shows progress and give up after 5 s without any (`Stalled`); progress is CPU time used by RobotStudio and its
-  virtual controllers (`STALL_CPU`, 0.25 s). Each also has a ceiling.
+  `load_powerpac`, `wait_controllers_ready`, `simulation_play`, `save`) wait as long as RobotStudio shows progress
+  and give up after 5 s without any (`Stalled`); progress is CPU time used by RobotStudio and its virtual
+  controllers (`STALL_CPU`, 0.25 s). Closing (`shutdown`) gives up after 30 s without progress (`stall_close`):
+  RobotStudio then waits for its virtual controller to stop and uses little CPU. Each step also has a ceiling.
 - **Changing them**: `TIMEOUTS` holds every default (seconds).
 
   ```python
@@ -246,7 +251,7 @@ Verified with RobotStudio 2026.4; read before writing a test.
   the start-up ("Your Free Trial Has Ended."), the same `WM_CLOSE` closed RobotStudio cleanly. `shutdown()` therefore
   closes only an enabled main window, as a person would.
 - **Never kill RobotStudio.** Its virtual controller (`RobVC.exe`) survives, and the next RobotStudio asks whether to
-  terminate it. `shutdown()` / `rsuitest-close` close through the UI (`WM_CLOSE`; UIA `Close()` was ignored).
+  terminate it. `shutdown()` / `rsuitest-close --pid` close through the UI (`WM_CLOSE`; UIA `Close()` was ignored).
 - **Never UIA-`Invoke` a button that opens a modal dialog**: it blocks until the dialog closes, then fails. Use
   `press(..., click=True)` (`open_dialog` does).
 - **The first click right after a tab switch can be lost.** `click_until` checks for the result and clicks once more.
